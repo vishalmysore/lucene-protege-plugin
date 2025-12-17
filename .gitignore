@@ -1,0 +1,9 @@
+target/
+*.class
+*.jar
+!pom.xml
+.idea/
+*.iml
+.vscode/
+.DS_Store
+lucene_index/

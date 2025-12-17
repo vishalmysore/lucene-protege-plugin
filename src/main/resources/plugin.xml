@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?eclipse version="3.0"?>
+
+<plugin name="Lucene RAG Plugin" version="1.0.0">
+    <extension id="RagQueryView" point="org.protege.editor.core.application.ViewComponent">
+        <label value="Lucene RAG"/>
+        <class value="org.vidyaastra.protege.rag.RagQueryPanel"/>
+        <headerColor value="@org.protege.editor.owl.OWLEditorKit"/>
+    </extension>
+</plugin>
