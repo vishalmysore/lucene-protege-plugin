@@ -13,7 +13,13 @@
     <description>
         Protégé plugin for RAG using Apache Lucene's KNN vector search with file-based storage
     </description>
-
+  <distributionManagement>
+    <repository>
+        <id>github</id>
+        <name>GitHub Packages</name>
+        <url>https://maven.pkg.github.com/vishalmysore/lucene-protege-plugin</url>
+    </repository>
+   </distributionManagement>
     <properties>
         <maven.compiler.source>11</maven.compiler.source>
         <maven.compiler.target>11</maven.compiler.target>
