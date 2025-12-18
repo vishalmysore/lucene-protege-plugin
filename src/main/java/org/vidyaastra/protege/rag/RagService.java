@@ -10,7 +10,8 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.util.*;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * RAG Service orchestrating Neo4j, Lucene Vector Store, and AI for queries
@@ -598,49 +599,232 @@ public class RagService implements AutoCloseable {
         
         logger.info("OWL chunker created {} chunks", owlChunks.size());
         
-        List<LuceneVectorStore.VectorData> vectorDataList = new ArrayList<>();
+        // Thread-safe collections for parallel processing
+        List<LuceneVectorStore.VectorData> vectorDataList = Collections.synchronizedList(new ArrayList<>());
+        AtomicInteger successCount = new AtomicInteger(0);
+        AtomicInteger failCount = new AtomicInteger(0);
+        AtomicInteger splitCount = new AtomicInteger(0);
+        AtomicInteger skippedCount = new AtomicInteger(0);
+        List<String> failedChunkIds = Collections.synchronizedList(new ArrayList<>());
+        
+        int totalChunks = owlChunks.size();
+        AtomicInteger processedChunks = new AtomicInteger(0);
+        
+        // Use thread pool for parallel processing (10 threads)
+        int threadCount = Math.min(10, Runtime.getRuntime().availableProcessors());
+        ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+        logger.info("Starting parallel indexing with {} threads", threadCount);
+        
+        List<Future<?>> futures = new ArrayList<>();
         
         for (OWLChunk chunk : owlChunks) {
-            // Convert OWL chunk to text representation
-            StringBuilder text = new StringBuilder();
-            text.append("Chunk ID: ").append(chunk.getId()).append("\n");
-            text.append("Strategy: ").append(chunk.getStrategy()).append("\n");
-            text.append("Axiom Count: ").append(chunk.getAxiomCount()).append("\n");
-            
-            // Add metadata
-            for (Map.Entry<String, Object> entry : chunk.getMetadata().entrySet()) {
-                text.append(entry.getKey()).append(": ").append(entry.getValue()).append("\n");
+            Future<?> future = executor.submit(() -> {
+                String chunkText = null;
+                try {
+                    int processed = processedChunks.incrementAndGet();
+                    
+                    // Progress logging every 100 chunks
+                    if (processed % 100 == 0) {
+                        logger.info(String.format("Progress: %d/%d chunks processed (%.1f%%). Success: %d, Failed: %d, Skipped: %d, Split: %d",
+                            processed, totalChunks, (processed * 100.0 / totalChunks),
+                            successCount.get(), failCount.get(), skippedCount.get(), splitCount.get()));
+                    }
+                    
+                    // Convert OWL chunk to text representation
+                    StringBuilder text = new StringBuilder();
+                    
+                    // Add the actual axiom content FIRST (most important for RAG)
+                    String axiomContent = chunk.toOWLString();
+                    if (axiomContent != null && !axiomContent.trim().isEmpty()) {
+                        text.append(axiomContent).append("\n\n");
+                    }
+                    
+                    // Add metadata at the end (for reference)
+                    text.append("--- Chunk Metadata ---\n");
+                    text.append("Chunk ID: ").append(chunk.getId()).append("\n");
+                    text.append("Strategy: ").append(chunk.getStrategy()).append("\n");
+                    text.append("Axiom Count: ").append(chunk.getAxiomCount()).append("\n");
+                    
+                    for (Map.Entry<String, Object> entry : chunk.getMetadata().entrySet()) {
+                        text.append(entry.getKey()).append(": ").append(entry.getValue()).append("\n");
+                    }
+                    
+                    chunkText = text.toString();
+                    if (chunkText.trim().isEmpty()) return;
+                    
+                    // Check chunk size and split if necessary
+                    int estimatedTokens = estimateTokenCount(chunkText);
+                    
+                    // Skip impossibly large chunks (> 50K tokens = ~150KB text)
+                    if (estimatedTokens > 50000) {
+                        logger.warn(String.format("Chunk %s is too large (%d tokens, %d chars). Skipping to avoid timeout.",
+                            chunk.getId(), estimatedTokens, chunkText.length()));
+                        skippedCount.incrementAndGet();
+                        failedChunkIds.add(chunk.getId() + " (too large)");
+                        return;
+                    }
+                    
+                    if (estimatedTokens > 6000) {
+                        logger.warn(String.format("Chunk %s exceeds token limit (%d tokens), splitting...",
+                                     chunk.getId(), estimatedTokens));
+                        List<String> subChunks = splitLargeChunk(chunkText, 5000);
+                        splitCount.addAndGet(subChunks.size());
+                        
+                        for (int i = 0; i < subChunks.size(); i++) {
+                            indexSingleChunk(
+                                chunk.getId() + "-part" + (i + 1),
+                                subChunks.get(i),
+                                chunkingStrategy,
+                                chunk,
+                                vectorDataList
+                            );
+                        }
+                    } else {
+                        indexSingleChunk(
+                            chunk.getId(),
+                            chunkText,
+                            chunkingStrategy,
+                            chunk,
+                            vectorDataList
+                        );
+                    }
+                    
+                    successCount.incrementAndGet();
+                    
+                } catch (Exception e) {
+                    failCount.incrementAndGet();
+                    failedChunkIds.add(chunk.getId());
+                    
+                    // Log detailed error information
+                    if (chunkText != null) {
+                        int chunkSize = chunkText.length();
+                        int estimatedTokens = estimateTokenCount(chunkText);
+                        String preview = chunkText.length() > 200 ? chunkText.substring(0, 200) + "..." : chunkText;
+                        
+                        logger.warn(String.format("Failed to index chunk %s: %s", chunk.getId(), e.getMessage()));
+                        logger.warn(String.format("  Chunk size: %d characters (~%d tokens)", chunkSize, estimatedTokens));
+                        logger.warn(String.format("  Content preview: %s", preview.replace("\n", " ")));
+                    } else {
+                        logger.warn(String.format("Failed to index chunk %s: %s", chunk.getId(), e.getMessage()));
+                        logger.warn("  (chunk text was null or not yet generated)");
+                    }
+                }
+            });
+            futures.add(future);
+        }
+        
+        // Wait for all tasks to complete
+        logger.info("Waiting for all {} indexing tasks to complete...", futures.size());
+        for (Future<?> future : futures) {
+            try {
+                future.get(); // Wait for completion
+            } catch (InterruptedException | ExecutionException e) {
+                logger.error("Error waiting for indexing task", e);
             }
-            text.append("\n");
-            
-            // Add axioms
-            text.append(chunk.toOWLString());
-            
-            String chunkText = text.toString();
-            if (chunkText.trim().isEmpty()) continue;
-            
-            List<Float> embedding = embeddingService.generateEmbedding(chunkText);
-            
-            Map<String, String> metadata = new HashMap<>();
-            metadata.put("source", "ontology");
-            metadata.put("type", "owl_chunk");
-            metadata.put("chunking_strategy", chunkingStrategy);
-            metadata.put("chunk_id", chunk.getId());
-            metadata.put("axiom_count", String.valueOf(chunk.getAxiomCount()));
-            metadata.put("strategy_used", chunk.getStrategy().toString());
-            
-            vectorDataList.add(new LuceneVectorStore.VectorData(
-                UUID.randomUUID().toString(),
-                embedding,
-                chunkText,
-                metadata
-            ));
+        }
+        
+        // Shutdown executor
+        executor.shutdown();
+        try {
+            if (!executor.awaitTermination(60, TimeUnit.SECONDS)) {
+                executor.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            executor.shutdownNow();
         }
         
         vectorStore.upsert(vectorDataList);
-        logger.info("Indexed {} OWL chunks to vector store", vectorDataList.size());
+        logger.info(String.format("Indexing complete: %d success, %d failed, %d skipped (too large), %d split into parts (total %d vectors)",
+                   successCount.get(), failCount.get(), skippedCount.get(), splitCount.get(), vectorDataList.size()));
+        
+        if (!failedChunkIds.isEmpty()) {
+            logger.warn(String.format("Failed/skipped chunks: %s", String.join(", ", failedChunkIds)));
+        }
         
         return vectorDataList.size();
+    }
+    
+    /**
+     * Estimates token count for a text string (conservative approximation: 1 token ≈ 3 characters)
+     * OpenAI's actual tokenizer may count more, so we use conservative estimate
+     */
+    private int estimateTokenCount(String text) {
+        return text.length() / 3;
+    }
+    
+    /**
+     * Splits a large chunk into smaller sub-chunks that fit within token limits
+     */
+    private List<String> splitLargeChunk(String chunkText, int maxTokens) {
+        List<String> subChunks = new ArrayList<>();
+        int estimatedTokens = estimateTokenCount(chunkText);
+        
+        if (estimatedTokens <= maxTokens) {
+            subChunks.add(chunkText);
+            return subChunks;
+        }
+        
+        // Split by lines (each axiom typically on its own line)
+        String[] lines = chunkText.split("\n");
+        StringBuilder currentChunk = new StringBuilder();
+        
+        // Keep header lines (Chunk ID, Strategy, etc.) in first chunk
+        int headerEndIndex = 0;
+        for (int i = 0; i < Math.min(10, lines.length); i++) {
+            if (lines[i].trim().isEmpty()) {
+                headerEndIndex = i + 1;
+                break;
+            }
+        }
+        
+        String header = String.join("\n", Arrays.copyOfRange(lines, 0, headerEndIndex));
+        
+        for (int i = headerEndIndex; i < lines.length; i++) {
+            String line = lines[i];
+            String testChunk = currentChunk.toString() + line + "\n";
+            
+            if (estimateTokenCount(testChunk) > maxTokens && currentChunk.length() > 0) {
+                // Current chunk is full, save it and start new one
+                subChunks.add(currentChunk.toString());
+                currentChunk = new StringBuilder(header).append("\n");
+            }
+            
+            currentChunk.append(line).append("\n");
+        }
+        
+        if (currentChunk.length() > 0) {
+            subChunks.add(currentChunk.toString());
+        }
+        
+        return subChunks;
+    }
+    
+    /**
+     * Indexes a single chunk with its metadata
+     */
+    private void indexSingleChunk(
+            String chunkId,
+            String chunkText,
+            String chunkingStrategy,
+            OWLChunk originalChunk,
+            List<LuceneVectorStore.VectorData> vectorDataList
+    ) throws IOException {
+        List<Float> embedding = embeddingService.generateEmbedding(chunkText);
+        
+        Map<String, String> metadata = new HashMap<>();
+        metadata.put("source", "ontology");
+        metadata.put("type", "owl_chunk");
+        metadata.put("chunking_strategy", chunkingStrategy);
+        metadata.put("chunk_id", chunkId);
+        metadata.put("axiom_count", String.valueOf(originalChunk.getAxiomCount()));
+        metadata.put("strategy_used", originalChunk.getStrategy().toString());
+        
+        vectorDataList.add(new LuceneVectorStore.VectorData(
+            UUID.randomUUID().toString(),
+            embedding,
+            chunkText,
+            metadata
+        ));
     }
     
     @Override
